@@ -1,10 +1,8 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Data.SqlClient;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using Microsoft.SqlServer.Management.Common;
 using Microsoft.SqlServer.Management.Smo;
 using NDesk.Options;
@@ -13,6 +11,15 @@ namespace SqlExport
 {
     class Program
     {
+        private static readonly ScriptingOptions _defaultOptions = new ScriptingOptions
+            {
+                Default = true,
+                SchemaQualify = true,
+                IncludeIfNotExists = true,
+                NoFileGroup = true,
+                DriAll = false,
+            };
+
         static void Main( string[] args )
         {
             string tablesFile = null;
@@ -40,35 +47,59 @@ namespace SqlExport
 
             var server = new Server( connection );
 
-            foreach ( Database db in server.Databases.Cast<Database>().Where( x => !( LoadFilters( dbFile ).Contains( x.Name ) ) ) )
+            IEnumerable<string> filters = LoadFilters( dbFile );
+
+            foreach ( Database db in server.Databases.Cast<Database>().Where( x => filters.Contains( x.Name ) || !filters.Any() ) )
             {
-                if ( db.IsSystemObject ) continue;
+                try
+                {
+                    if ( db.IsSystemObject ) continue;
 
-                Console.WriteLine( "Processing database {0}.", db.Name );
+                    Console.WriteLine( "Processing database {0}.", db.Name );
 
-                var scripter = new Scripter( server );
+                    var script = new Script();
 
-                var scriptOptions = new ScriptingOptions
+                    script.Add(
+                        db.Script(
+                            new ScriptingOptions
+                                {
+                                    NoFileGroup = true,
+                                    Default = true,
+                                    IncludeIfNotExists = true
+                                } ) );
+
+                    script.Add( String.Format( "GO; Use {0};", db.Name ) );
+
+                    foreach ( var collection in GetDbCollections( db ) )
                     {
-                        AllowSystemObjects = false,
-                        AnsiFile = true,
-                        AppendToFile = false,
-                        Default = true,
-                        DriAll = true,
-                        Indexes = true,
-                        ToFileOnly = true,
-                        WithDependencies = true,
-                        Triggers = true,
-                        Statistics = true
-                    };
+                        if ( collection is IEnumerable<Table> || collection is IEnumerable<View> )
+                        {
+                            ScriptComplex( collection, script );
+                        }
+                        else
+                        {
+                            foreach ( dynamic obj in collection )
+                            {
+                                Console.WriteLine( "Processing object: {0}", obj.Urn );
 
-                scripter.Options = scriptOptions;
+                                try
+                                {
+                                    script.Add( obj.Script( _defaultOptions ) );
+                                }
+                                catch ( Exception e )
+                                {
+                                    Console.WriteLine( "Error processing object {0} => {1}", obj.Urn, e.Message );
+                                }
+                            }
+                        }
+                    }
 
-                DependencyTree tree = scripter.DiscoverDependencies( GetDatabaseObjects( db ).ToArray(), true );
-
-                DependencyCollection collection = scripter.WalkDependencies( tree );
-
-                File.WriteAllLines( db.Name + ".sql", scripter.ScriptWithList( collection ).OfType<string>() );
+                    File.WriteAllText( db.Name + ".sql", script.ToString() );
+                }
+                catch ( Exception e )
+                {
+                    Console.WriteLine( "Could not export db {0}.", db.Name );
+                }
             }
         }
 
@@ -77,24 +108,95 @@ namespace SqlExport
             return filename == null ? Enumerable.Empty<string>() : File.ReadAllLines( filename );
         }
 
-        public static IEnumerable<SqlSmoObject> GetDatabaseObjects( Database db )
+        private static IEnumerable<IEnumerable<SqlSmoObject>> GetDbCollections( Database db )
         {
-            var objects = new List<SqlSmoObject>();
-
-            IEnumerable<string> allowedTypes = GetAllowedObjectTypes();
-
-            foreach ( PropertyInfo property in db.GetType().GetProperties() )
+            return new IEnumerable<SqlSmoObject>[]
+                {
+                    db.Schemas.Cast<Schema>().ToList(),
+                    db.UserDefinedTypes.Cast<UserDefinedType>().ToList(),
+                    db.UserDefinedTableTypes.Cast<UserDefinedTableType>().ToList(),
+                    db.UserDefinedDataTypes.Cast<UserDefinedDataType>().ToList(),
+                    db.FullTextCatalogs.Cast<FullTextCatalog>().ToList(),
+                    db.FullTextStopLists.Cast<FullTextStopList>().ToList(),
+                    db.Tables.Cast<Table>().ToList(),
+                    db.Views.Cast<View>().ToList(),
+                    db.StoredProcedures.Cast<StoredProcedure>().ToList(),
+                    db.UserDefinedFunctions.Cast<UserDefinedFunction>().ToList()
+                };
+        }
+ 
+        private static void ScriptComplex( IEnumerable<dynamic> objects, Script script )
+        {
+            foreach ( dynamic obj in ApplySystemFilter( objects ) )
             {
-                if ( !typeof ( SchemaCollectionBase ).IsAssignableFrom( property.PropertyType ) ) continue;
+                Console.WriteLine( "Processing object: {0}", obj.Urn );
 
-                var enumerable = property.GetValue( db, null );
+                try
+                {
+                    script.Add( obj.Script( _defaultOptions ) );
 
-                if ( enumerable == null ) continue;
+                    script.Add(
+                        obj.Script(
+                            new ScriptingOptions
+                                {
+                                    Indexes = true,
+                                    SchemaQualify = true,
+                                    IncludeIfNotExists = true
+                                } ) );
 
-                objects.AddRange( ( (IEnumerable) enumerable ).Cast<SqlSmoObject>().Where( x => allowedTypes.Contains( x.GetType().Name ) ) );
+                    foreach ( dynamic trigger in obj.Triggers )
+                    {
+                        script.Add( trigger.Script( _defaultOptions ) );
+                    }
+
+                    foreach ( dynamic statistic in obj.Statistics )
+                    {
+                        script.Add( statistic.Script( _defaultOptions ) );
+                    }
+                }
+                catch ( Exception e )
+                {
+                    Console.WriteLine( "Error processing object {0} => {1}", obj.Urn, e.Message );
+                }
             }
 
-            return objects;
+            foreach ( dynamic obj in ApplySystemFilter( objects ) )
+            {
+                Console.WriteLine( "Processing second pass: {0}", obj.Urn );
+
+                try
+                {
+                    script.Add(
+                        obj.Script(
+                            new ScriptingOptions
+                                {
+                                    DriAll = true,
+                                    SchemaQualify = true,
+                                    IncludeIfNotExists = true
+                                } ) );
+                }
+                catch ( Exception e )
+                {
+                    Console.WriteLine( "Error processing object {0} => {1}", obj.Urn, e.Message );
+                }
+            }
+        }
+
+        private static IEnumerable<dynamic> ApplySystemFilter( IEnumerable<dynamic> objects )
+        {
+            foreach ( dynamic obj in objects )
+            {
+                try
+                {
+                    if ( obj.IsSystemObject ) continue;
+                }
+                catch ( Exception e )
+                {
+                    Console.WriteLine( "Error processing object {0} => {1}", obj.Urn, e.Message );
+                }
+
+                yield return obj;
+            }
         }
 
         private static IEnumerable<string> GetAllowedObjectTypes()
