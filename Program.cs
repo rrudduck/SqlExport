@@ -14,10 +14,11 @@ namespace SqlExport
         private static readonly ScriptingOptions _defaultOptions = new ScriptingOptions
             {
                 Default = true,
+                DriDefaults = true,
+                DriUniqueKeys = true,
                 SchemaQualify = true,
                 IncludeIfNotExists = true,
                 NoFileGroup = true,
-                DriAll = false,
             };
 
         static void Main( string[] args )
@@ -32,11 +33,14 @@ namespace SqlExport
 
             string output = null;
 
+            string dbName = null;
+
             var options = new OptionSet
                 {
                     { "t=", "File describing which tables to import data for each DB. If this is null, no data is imported.", s => tablesFile = s },
                     { "s=", "File describing which objects to import schema for. If this is null, all schema is imported.", s => schemaFile = s },
                     { "d=", "File describing which databses to import. If this is null, all dbs on the server are imported.", s => dbFile = s },
+                    { "db=", "The name of the database to export if running for a single database.", s => dbName = s },
                     { "c=", "Connection string.", s => connectionString = s },
                     { "o=", "The path to output the sql scripts.", s => output = s }
                 };
@@ -53,6 +57,8 @@ namespace SqlExport
             {
                 try
                 {
+                    if ( !String.IsNullOrEmpty( dbName ) && dbName != db.Name ) continue;
+
                     if ( db.IsSystemObject ) continue;
 
                     Console.WriteLine( "Processing database {0}.", db.Name );
@@ -64,21 +70,22 @@ namespace SqlExport
                             new ScriptingOptions
                                 {
                                     NoFileGroup = true,
-                                    Default = true,
                                     IncludeIfNotExists = true
                                 } ) );
 
-                    script.Add( String.Format( "GO; Use {0};", db.Name ) );
+                    script.Add( String.Format( "Use {0};", db.Name ) );
 
                     foreach ( var collection in GetDbCollections( db ) )
                     {
-                        if ( collection is IEnumerable<Table> || collection is IEnumerable<View> )
+                        var tables = collection as IEnumerable<Table>;
+
+                        if ( tables != null )
                         {
-                            ScriptComplex( collection, script );
+                            ScriptTables( tables, script );
                         }
                         else
                         {
-                            foreach ( dynamic obj in collection )
+                            foreach ( dynamic obj in ApplySystemFilter( collection ) )
                             {
                                 Console.WriteLine( "Processing object: {0}", obj.Urn );
 
@@ -98,7 +105,7 @@ namespace SqlExport
                 }
                 catch ( Exception e )
                 {
-                    Console.WriteLine( "Could not export db {0}.", db.Name );
+                    Console.WriteLine( "Could not export db {0}. Error was {1}.", db.Name, e.Message );
                 }
             }
         }
@@ -124,66 +131,47 @@ namespace SqlExport
                     db.UserDefinedFunctions.Cast<UserDefinedFunction>().ToList()
                 };
         }
- 
-        private static void ScriptComplex( IEnumerable<dynamic> objects, Script script )
+
+        private static void ScriptTables( IEnumerable<Table> tables, Script script )
         {
-            foreach ( dynamic obj in ApplySystemFilter( objects ) )
+            foreach ( Table table in ApplySystemFilter( tables ) )
             {
-                Console.WriteLine( "Processing object: {0}", obj.Urn );
+                script.Add( table.Script( _defaultOptions ) );
 
-                try
+                foreach ( Index index in table.Indexes )
                 {
-                    script.Add( obj.Script( _defaultOptions ) );
-
-                    script.Add(
-                        obj.Script(
-                            new ScriptingOptions
-                                {
-                                    Indexes = true,
-                                    SchemaQualify = true,
-                                    IncludeIfNotExists = true
-                                } ) );
-
-                    foreach ( dynamic trigger in obj.Triggers )
-                    {
-                        script.Add( trigger.Script( _defaultOptions ) );
-                    }
-
-                    foreach ( dynamic statistic in obj.Statistics )
-                    {
-                        script.Add( statistic.Script( _defaultOptions ) );
-                    }
+                    script.Add( index.Script( _defaultOptions ) );
                 }
-                catch ( Exception e )
+
+                foreach ( Trigger trigger in table.Triggers )
                 {
-                    Console.WriteLine( "Error processing object {0} => {1}", obj.Urn, e.Message );
+                    script.Add( trigger.Script( _defaultOptions ) );
+                }
+
+                foreach ( Statistic statistic in table.Statistics )
+                {
+                    script.Add( statistic.Script( _defaultOptions ) );
                 }
             }
 
-            foreach ( dynamic obj in ApplySystemFilter( objects ) )
+            foreach ( Table table in tables )
             {
-                Console.WriteLine( "Processing second pass: {0}", obj.Urn );
-
-                try
+                foreach ( ForeignKey key in table.ForeignKeys )
                 {
-                    script.Add(
-                        obj.Script(
-                            new ScriptingOptions
-                                {
-                                    DriAll = true,
-                                    SchemaQualify = true,
-                                    IncludeIfNotExists = true
-                                } ) );
+                    script.Add( key.Script( _defaultOptions ) );
                 }
-                catch ( Exception e )
+
+                foreach ( Check check in table.Checks )
                 {
-                    Console.WriteLine( "Error processing object {0} => {1}", obj.Urn, e.Message );
+                    script.Add( check.Script( _defaultOptions ) );
                 }
             }
         }
 
         private static IEnumerable<dynamic> ApplySystemFilter( IEnumerable<dynamic> objects )
         {
+            var results = new List<dynamic>();
+
             foreach ( dynamic obj in objects )
             {
                 try
@@ -195,35 +183,10 @@ namespace SqlExport
                     Console.WriteLine( "Error processing object {0} => {1}", obj.Urn, e.Message );
                 }
 
-                yield return obj;
+                results.Add( obj );
             }
-        }
 
-        private static IEnumerable<string> GetAllowedObjectTypes()
-        {
-            return new[]
-                {
-                    "UserDefinedFunction",
-                    "View",
-                    "Table",
-                    "StoredProcedure",
-                    "Default",
-                    "Rule",
-                    "Trigger",
-                    "UserDefinedAggregate",
-                    "Synonym",
-                    "Sequence",
-                    "UserDefinedDataType",
-                    "XmlSchemaCollection",
-                    "UserDefinedType",
-                    "UserDefinedTableType",
-                    "PartitionScheme",
-                    "PartitionFunction",
-                    "DdlTrigger",
-                    "PlanGuide",
-                    "SqlAssembly",
-                    "UnresolvedEntity"
-                };
+            return results;
         }
     }
 }
